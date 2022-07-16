@@ -1,0 +1,217 @@
+import os
+import sys
+import random
+
+import numpy as np
+import matplotlib.pyplot as plt
+from glob import glob
+
+import skimage
+from skimage import io
+from sklearn.model_selection import train_test_split
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.callbacks import ModelCheckpoint, CSVLogger
+from tensorflow.keras.utils import to_categorical
+
+## Loading the data
+
+all_images = np.load('results/all_data_images_overlap_0.5.npz')['arr_0']
+all_masks = np.load('results/all_data_masks_overlap_0.5.npz')['arr_0']
+all_labels = np.load('results/all_data_labels_overlap_0.5.npz')['arr_0']
+
+print(all_images.shape)
+print(all_masks.shape)
+print(all_labels.shape)
+
+### Change to Categorical
+
+all_cats = to_categorical(all_labels, num_classes=5)
+all_cats.shape
+
+cek_ind=0
+plt.figure(figsize=(16,4))
+plt.subplot(1,5,1)
+plt.imshow(all_cats[cek_ind][:,:,0], cmap='gray');
+plt.title('Class 0 - Background')
+plt.subplot(1,5,2)
+plt.imshow(all_cats[cek_ind][:,:,1], cmap='gray');
+plt.title('Class 1 - Epithelial')
+plt.subplot(1,5,3)
+plt.imshow(all_cats[cek_ind][:,:,2], cmap='gray');
+plt.title('Class 2 - Lymphocyte')
+plt.subplot(1,5,4)
+plt.imshow(all_cats[cek_ind][:,:,3], cmap='gray');
+plt.title('Class 3 - Macrophage')
+plt.subplot(1,5,5)
+plt.imshow(all_cats[cek_ind][:,:,4], cmap='gray');
+plt.title('Class 4 - Neutrophil')
+
+print("Class yang ada dalam Cell: ", np.unique(all_labels[cek_ind]))
+
+### Prepare Training, Validation Data
+
+X_train, X_test, y_train, y_test = train_test_split(all_images, all_cats, test_size=0.2, random_state=0)
+X_val, X_test, y_val, y_test = train_test_split(X_test, y_test, test_size=0.5, random_state=0)
+
+print("Data latih: ", X_train.shape)
+print("Data validasi: ", X_val.shape)
+print("Data uji: ", X_test.shape)
+
+print("Label data latih:", y_train.shape)
+print("Label data validasi:", y_val.shape)
+print("Label data uji:", y_test.shape)
+
+## Model CNN
+### Convolutional Blocks
+
+def down_block(x, filters, kernel_size=(3, 3), init='he_normal', padding="same", strides=1):
+    c = keras.layers.Conv2D(filters, kernel_size, padding=padding, strides=strides, kernel_initializer=init, activation="relu")(x)
+    c = keras.layers.Conv2D(filters, kernel_size, padding=padding, strides=strides, kernel_initializer=init, activation="relu")(c)
+    p = keras.layers.MaxPool2D((2, 2), (2, 2))(c)
+    return c, p
+
+def up_block(x, skip, filters, kernel_size=(3, 3), init='he_normal', padding="same", strides=1):
+    us = keras.layers.UpSampling2D((2, 2))(x)
+    concat = keras.layers.Concatenate()([us, skip])
+    c = keras.layers.Conv2D(filters, kernel_size, padding=padding, strides=strides, kernel_initializer=init, activation="relu")(concat)
+    c = keras.layers.Conv2D(filters, kernel_size, padding=padding, strides=strides, kernel_initializer=init, activation="relu")(c)
+    return c
+
+def bottleneck(x, filters, kernel_size=(3, 3), init='he_normal', padding="same", strides=1):
+    c = keras.layers.Conv2D(filters, kernel_size, padding=padding, strides=strides, kernel_initializer=init, activation="relu")(x)
+    c = keras.layers.Conv2D(filters, kernel_size, padding=padding, strides=strides, kernel_initializer=init, activation="relu")(c)
+    c = keras.layers.Dropout(0.25)(c) # ditambahi dropout
+    return c
+    
+### UNet Model
+
+def create_unet(image_size=256, n_class=5, filters = [16, 32, 64, 128, 256]): # original model: filters = [64, 128, 256, 512, 1024]
+    inputs = keras.layers.Input((image_size, image_size, 3))
+    
+    p0 = inputs
+    c1, p1 = down_block(p0, filters[0]) 
+    c2, p2 = down_block(p1, filters[1]) 
+    c3, p3 = down_block(p2, filters[2]) 
+    c4, p4 = down_block(p3, filters[3]) 
+    
+    bn = bottleneck(p4, filters[4])
+    
+    u1 = up_block(bn, c4, filters[3]) 
+    u2 = up_block(u1, c3, filters[2]) 
+    u3 = up_block(u2, c2, filters[1]) 
+    u4 = up_block(u3, c1, filters[0])
+    
+    outputs = keras.layers.Conv2D(n_class, (1, 1), padding="same", activation='softmax')(u4)
+    model = keras.models.Model(inputs, outputs)
+    return model
+    
+model = create_unet()
+model.summary()
+
+### Train the Model
+
+epochs = 20
+batch_size = 4
+lr = 1e-4
+x_axis_inc = 1
+
+def plot_history(sejarah, fig_train, epochs, subtitle, acc_ylim = 1, loss_ylim=1.2, figsize=(14, 4), x_axis_inc=1):
+    epoch_list = list(range(1,epochs+1))
+    y_train_acc = sejarah.history['accuracy'] # binary_accuracy  accuracy
+    y_val_acc = sejarah.history['val_accuracy'] # val_binary_accuracy  val_accuracy
+    y_train_loss = sejarah.history['loss']
+    y_val_loss = sejarah.history['val_loss']
+    f, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+    t = f.suptitle(subtitle, fontsize=12)
+    f.subplots_adjust(top=0.85, wspace=0.3)
+
+    ax1.plot(epoch_list, y_train_acc, label='Train Accuracy')
+    ax1.plot(epoch_list, y_val_acc, label='Validation Accuracy')
+    ax1.set_xticks(np.arange(0, epochs+1, x_axis_inc))
+    ax1.set_ylim(0.2,acc_ylim)
+    ax1.set_ylabel('Accuracy Value')
+    ax1.set_xlabel('Epoch')
+    ax1.set_title('Accuracy')
+    l1 = ax1.legend(loc="best")
+
+    ax2.plot(epoch_list, y_train_loss, label='Train Loss')
+    ax2.plot(epoch_list, y_val_loss, label='Validation Loss')
+    ax2.set_xticks(np.arange(0, epochs+1, x_axis_inc))
+    ax2.set_ylim(0,loss_ylim)
+    ax2.set_ylabel('Cross Entropy')
+    ax2.set_xlabel('Epoch')
+    ax2.set_title('Loss')
+    l2 = ax2.legend(loc="best")
+
+    plt.savefig(fig_train)
+    
+fig_train = 'results/monusac_unet_filter16_ov5'
+log_file = 'results/monusac_unet_filter16_ov5.csv'
+model_path = 'results/monusac_unet_filter16_ov5.h5'
+sub_title = 'Multi-organ Nuclei Segmentation using UNet'
+
+model.compile(loss="categorical_crossentropy",
+              optimizer=keras.optimizers.Adam(learning_rate=lr),
+              metrics=["accuracy"])
+
+callbacks = [CSVLogger(log_file),  ModelCheckpoint(filepath=model_path, monitor='val_accuracy', mode='max', save_best_only=True, verbose=0)]
+
+history = model.fit(X_train, y_train, validation_data=(X_val, y_val), batch_size=batch_size, epochs=epochs, verbose=1, callbacks=callbacks)
+
+plot_history(history, fig_train, epochs, sub_title)
+
+### Inference Process
+
+y_test_predict = model.predict(X_test)
+y_test_predict.shape
+
+ind_test = random.randint(0, X_test.shape[0]-1)
+print("Testing index =", ind_test)
+
+# Ground Truth
+plt.figure(figsize=(16,4))
+plt.subplot(1,5,1)
+plt.imshow(y_test[ind_test][:,:,0], cmap='gray');
+plt.title('Class 0 - Background')
+
+plt.subplot(1,5,2)
+plt.imshow(y_test[ind_test][:,:,1], cmap='gray');
+plt.title('Class 1 - Epithelial')
+
+plt.subplot(1,5,3)
+plt.imshow(y_test[ind_test][:,:,2], cmap='gray');
+plt.title('Class 2 - Lymphocyte')
+
+plt.subplot(1,5,4)
+plt.imshow(y_test[ind_test][:,:,3], cmap='gray');
+plt.title('Class 3 - Macrophage')
+
+plt.subplot(1,5,5)
+plt.imshow(y_test[ind_test][:,:,4], cmap='gray');
+plt.title('Class 4 - Neutrophil')
+
+# Prediction
+plt.figure(figsize=(16,4))
+plt.subplot(1,5,1)
+plt.imshow(y_test_predict[ind_test][:,:,0], cmap='gray');
+plt.title('Class 0 - Background')
+
+plt.subplot(1,5,2)
+plt.imshow(y_test_predict[ind_test][:,:,1], cmap='gray');
+plt.title('Class 1 - Epithelial')
+
+plt.subplot(1,5,3)
+plt.imshow(y_test_predict[ind_test][:,:,2], cmap='gray');
+plt.title('Class 2 - Lymphocyte')
+
+plt.subplot(1,5,4)
+plt.imshow(y_test_predict[ind_test][:,:,3], cmap='gray');
+plt.title('Class 3 - Macrophage')
+
+plt.subplot(1,5,5)
+plt.imshow(y_test_predict[ind_test][:,:,4], cmap='gray');
+plt.title('Class 4 - Neutrophil')
+
+np.savez_compressed('results/unet16_predict_test_ov5.npz', y_test_predict)
